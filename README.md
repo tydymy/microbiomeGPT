@@ -25,7 +25,7 @@ pip install microbiomeGPT
 
 ```python
 import pandas as pd
-from microbiomeGPT.preprocessing import matrix_rclr
+from gemelli.preprocessing import matrix_rclr
 
 # Load data
 metadata = pd.read_csv('data/sampleMetadata.csv', index_col='sample_id')
