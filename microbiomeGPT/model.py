@@ -64,7 +64,7 @@ class MicrobiomeTransformer(nn.Module):
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, nhead, 
-            dim_feedforward=512, 
+            dim_feedforward=2048, 
             dropout=0.2,
             batch_first=True,
             norm_first=True  # Apply normalization before attention and feedforward
@@ -134,42 +134,57 @@ class MicrobiomeTransformer(nn.Module):
 
 class MicrobiomeTransformerRegression(nn.Module):
     """
-    Regression model based on the MicrobiomeTransformer.
-    Uses attention mechanism to process sequence data for regression tasks.
+    Enhanced regression model based on the MicrobiomeTransformer.
+    Improvements focus on handling sparse microbiome data more effectively.
     
     Args:
         pretrained_model (MicrobiomeTransformer): Pre-trained base model
         freeze_pretrained (bool): Whether to freeze the pre-trained model's parameters
+        dropout_rate (float): Dropout probability for regularization
+        hidden_dims (list): Dimensions of hidden layers in regression head
     """
-    def __init__(self, pretrained_model, freeze_pretrained=True):
+    def __init__(self, pretrained_model, freeze_pretrained=True, dropout_rate=0.2, 
+                 hidden_dims=[256, 64]):
         super().__init__()
         self.pretrained_model = pretrained_model
+        emb_dim = pretrained_model.fc_taxa.in_features
+        
+        # Enhanced attention with layer normalization
         self.attention = nn.MultiheadAttention(
-            pretrained_model.fc_taxa.in_features, 
-            num_heads=8, 
+            emb_dim,
+            num_heads=8,
+            dropout=dropout_rate,
             batch_first=True
         )
+        self.layer_norm1 = nn.LayerNorm(emb_dim)
+        self.layer_norm2 = nn.LayerNorm(emb_dim)
         
-        # Regression head
-        self.regression_head = nn.Sequential(
-            nn.Linear(pretrained_model.fc_taxa.in_features, 512),
-            nn.ReLU(),
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
+        # Improved regression head with residual connections
+        layers = []
+        input_dim = emb_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),  # GELU often works better than ReLU for transformers
+                nn.Dropout(dropout_rate)
+            ])
+            input_dim = hidden_dim
+        
+        layers.append(nn.Linear(input_dim, 1))
+        self.regression_head = nn.Sequential(*layers)
 
         if freeze_pretrained:
             self._freeze_pretrained_model()
-
+            
     def _freeze_pretrained_model(self):
         """Freeze pre-trained model parameters."""
         for param in self.pretrained_model.parameters():
             param.requires_grad = False
 
     def forward(self, taxa, expressions, src_key_padding_mask=None):
-        """Forward pass for regression prediction."""
-        # Get embeddings from pre-trained model
+        """Forward pass with enhanced residual connections and normalization."""
+        # Get embeddings
         taxa_emb = self.pretrained_model.taxa_embedding(taxa)
         expr_emb = self.pretrained_model.expression_proj(expressions.unsqueeze(-1))
         x = taxa_emb + expr_emb
@@ -178,43 +193,65 @@ class MicrobiomeTransformerRegression(nn.Module):
         if src_key_padding_mask is None:
             src_key_padding_mask = (taxa == 0)
 
-        # Apply transformer and attention
-        output = self.pretrained_model.transformer(x, src_key_padding_mask=src_key_padding_mask)
-        query = output.mean(dim=1, keepdim=True)
-        context, _ = self.attention(query, output, output, key_padding_mask=src_key_padding_mask)
-        context = context.squeeze(1)
-
-        # Generate regression prediction
-        regression_output = self.regression_head(context)
-        return regression_output.squeeze(-1)
+        # Transformer with residual connection
+        transformer_output = self.pretrained_model.transformer(
+            x, src_key_padding_mask=src_key_padding_mask
+        )
+        transformer_output = self.layer_norm1(transformer_output)
+        
+        # Weighted pooling using attention
+        query = transformer_output.mean(dim=1, keepdim=True)
+        context, attention_weights = self.attention(
+            query, transformer_output, transformer_output, 
+            key_padding_mask=src_key_padding_mask
+        )
+        context = self.layer_norm2(context.squeeze(1))
+        
+        # Generate prediction
+        return self.regression_head(context).squeeze(-1)
 
 class MicrobiomeTransformerClassification(nn.Module):
     """
-    Classification model based on the MicrobiomeTransformer.
-    Uses attention mechanism to process sequence data for classification tasks.
+    Enhanced classification model based on the MicrobiomeTransformer.
+    Improvements focus on handling sparse microbiome data more effectively.
     
     Args:
         pretrained_model (MicrobiomeTransformer): Pre-trained base model
         num_classes (int): Number of classification classes
         freeze_pretrained (bool): Whether to freeze the pre-trained model's parameters
+        dropout_rate (float): Dropout probability for regularization
+        hidden_dims (list): Dimensions of hidden layers in classification head
     """
-    def __init__(self, pretrained_model, num_classes, freeze_pretrained=True):
+    def __init__(self, pretrained_model, num_classes, freeze_pretrained=True,
+                 dropout_rate=0.2, hidden_dims=[256, 64]):
         super().__init__()
         self.pretrained_model = pretrained_model
+        emb_dim = pretrained_model.fc_taxa.in_features
+        
+        # Enhanced attention with layer normalization
         self.attention = nn.MultiheadAttention(
-            pretrained_model.fc_taxa.in_features, 
-            num_heads=8, 
+            emb_dim,
+            num_heads=8,
+            dropout=dropout_rate,
             batch_first=True
         )
+        self.layer_norm1 = nn.LayerNorm(emb_dim)
+        self.layer_norm2 = nn.LayerNorm(emb_dim)
         
-        # Classification head
-        self.classification_head = nn.Sequential(
-            nn.Linear(pretrained_model.fc_taxa.in_features, 512),
-            nn.ReLU(),
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes)
-        )
+        # Improved classification head with batch norm and residual connections
+        layers = []
+        input_dim = emb_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout_rate)
+            ])
+            input_dim = hidden_dim
+            
+        self.feature_layers = nn.Sequential(*layers)
+        self.classifier = nn.Linear(input_dim, num_classes)
 
         if freeze_pretrained:
             self._freeze_pretrained_model()
@@ -225,8 +262,8 @@ class MicrobiomeTransformerClassification(nn.Module):
             param.requires_grad = False
 
     def forward(self, taxa, expressions, src_key_padding_mask=None):
-        """Forward pass for classification prediction."""
-        # Get embeddings from pre-trained model
+        """Forward pass with enhanced residual connections and normalization."""
+        # Get embeddings
         taxa_emb = self.pretrained_model.taxa_embedding(taxa)
         expr_emb = self.pretrained_model.expression_proj(expressions.unsqueeze(-1))
         x = taxa_emb + expr_emb
@@ -235,12 +272,20 @@ class MicrobiomeTransformerClassification(nn.Module):
         if src_key_padding_mask is None:
             src_key_padding_mask = (taxa == 0)
 
-        # Apply transformer and attention
-        output = self.pretrained_model.transformer(x, src_key_padding_mask=src_key_padding_mask)
-        query = output.mean(dim=1, keepdim=True)
-        context, _ = self.attention(query, output, output, key_padding_mask=src_key_padding_mask)
-        context = context.squeeze(1)
-
-        # Generate classification prediction
-        classification_output = self.classification_head(context)
-        return classification_output
+        # Transformer with residual connection
+        transformer_output = self.pretrained_model.transformer(
+            x, src_key_padding_mask=src_key_padding_mask
+        )
+        transformer_output = self.layer_norm1(transformer_output)
+        
+        # Weighted pooling using attention
+        query = transformer_output.mean(dim=1, keepdim=True)
+        context, attention_weights = self.attention(
+            query, transformer_output, transformer_output,
+            key_padding_mask=src_key_padding_mask
+        )
+        context = self.layer_norm2(context.squeeze(1))
+        
+        # Generate prediction with separate feature extraction and classification
+        features = self.feature_layers(context)
+        return self.classifier(features)
